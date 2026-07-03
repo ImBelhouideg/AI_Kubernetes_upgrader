@@ -1,0 +1,323 @@
+# Kubernetes Upgrade Readiness Assessor
+
+A CLI tool that combines **deterministic kubectl analysis** and **LLM-powered reasoning** to assess whether a Kubernetes cluster is ready for a version upgrade.
+
+## Demo
+
+```
+python kube_assessor.py -s 1.34 -t 1.35 -o report.md
+```
+
+```
+============================================================
+  Kubernetes Upgrade Readiness Assessor
+  1.34 → 1.35
+============================================================
+
+Collecting cluster state...
+  [1/10] kubectl version
+  [2/10] kubectl cluster-info
+  ...
+Running static analysis...
+  Removed APIs    : 0
+  Deprecated APIs : 0
+  CRDs            : 6
+  Webhooks        : 2
+  Readiness Score : 60/100
+  Confidence      : 95%
+
+Calling LLM (OpenRouter)...
+Generating report...
+
+✅ Report written to: report.md
+```
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     kube_assessor.py                        │
+│                                                             │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
+│  │ KubectlClient│───►│ Static       │───►│ Report       │  │
+│  │              │    │ Analyzer     │    │ Generator    │  │
+│  │ kubectl get  │    │              │    │              │  │
+│  │ nodes, crds, │    │ - APIs scan  │    │ Markdown     │  │
+│  │ webhooks,    │    │ - CRD scan   │    │ with scores  │  │
+│  │ workloads... │    │ - Security   │    │ and tables   │  │
+│  └──────────────┘    │ - Webhooks   │    └──────┬───────┘  │
+│                      │ - Runtime    │           │          │
+│                      └──────┬───────┘           │          │
+│                             │                   │          │
+│                      ┌──────▼───────┐           │          │
+│                      │ LLM via      │───────────►          │
+│                      │ OpenRouter   │                      │
+│                      │              │                      │
+│                      │ DeepSeek /   │                      │
+│                      │ Claude / GPT │                      │
+│                      └──────────────┘                      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Two complementary layers
+
+| Layer | Technology | Role |
+|---|---|---|
+| Static Analysis | Python + kubectl | Collects real cluster data, detects removed/deprecated APIs, scans CRDs, webhooks, security — **cannot hallucinate** because it reads live cluster state |
+| LLM Analysis | DeepSeek via OpenRouter | Reasons about operator compatibility, failure scenarios, upgrade ordering — adds expert judgment the code alone cannot provide |
+
+---
+
+## Key Concepts
+
+### CRD (Custom Resource Definition)
+Kubernetes ships with built-in resource types: Pod, Service, Deployment. A CRD lets anyone **extend Kubernetes with custom resource types**. For example, cert-manager adds `Certificate`, `Issuer`, `ClusterIssuer` — objects Kubernetes does not know natively but accepts once the CRD is installed.
+
+During an upgrade, CRDs must be checked for:
+- API version compatibility with the target Kubernetes version
+- Storage version stability
+- Conversion webhook requirements
+
+### cert-manager
+An operator that **automates TLS certificate lifecycle management** (issuance, renewal, revocation). Instead of manually managing SSL certificates, cert-manager watches `Certificate` resources and renews them automatically before expiry. It integrates with Let's Encrypt, HashiCorp Vault, and other certificate authorities. It installs 6 CRDs into your cluster.
+
+### Admission Webhooks
+When you run `kubectl apply`, Kubernetes sends the resource to an external HTTP server **before** accepting it. Two types:
+- **ValidatingWebhookConfiguration** — accepts or rejects the resource
+- **MutatingWebhookConfiguration** — modifies the resource before storing it
+
+**The upgrade risk:** `FailurePolicy=Fail` means that if the webhook server is **unavailable** (which can happen during an upgrade as pods restart), Kubernetes **rejects all resource creation requests** — potentially blocking the entire cluster for several minutes.
+
+---
+
+## What the Tool Analyzes
+
+| Area | What is checked |
+|---|---|
+| **APIs** | Removed and deprecated API versions used by cluster resources |
+| **CRDs** | Installed custom resource definitions, their versions, storage version, conversion strategy |
+| **Webhooks** | Validating and mutating webhooks, FailurePolicy, SideEffects |
+| **Security** | hostNetwork pods, privileged containers, hostPath volumes, hostPID, hostIPC |
+| **Runtime** | Container runtime version (containerd/docker), kubelet versions, OS |
+| **Storage** | StorageClasses, PersistentVolumes |
+| **Workloads** | Deployments, StatefulSets, DaemonSets, CronJobs across all namespaces |
+
+---
+
+## Scoring
+
+### Readiness Score (0–100)
+
+| Deduction | Reason |
+|---|---|
+| -40 per issue | Removed API usage (Critical) |
+| -10 per issue | Deprecated API usage (Medium) |
+| -10 | Privileged containers detected |
+| -10 per webhook | Webhook with FailurePolicy=Fail |
+| -5 | HostPath volumes detected |
+| -5 | HostNetwork pods detected |
+
+| Score | Decision |
+|---|---|
+| 90–100 | ✅ APPROVED |
+| 75–89 | ⚠️ CONDITIONAL |
+| 0–74 | ❌ NOT RECOMMENDED |
+
+### Confidence Score (0–100)
+
+Decreases when data is unavailable:
+
+| Missing data | Deduction |
+|---|---|
+| kubectl version unavailable | -40% |
+| Workloads unavailable | -30% |
+| Nodes unavailable | -15% |
+| CRDs unavailable | -10% |
+| Webhooks unavailable | -5% |
+| Metrics unavailable | -5% |
+
+---
+
+## Installation
+
+### Prerequisites
+
+- Python 3.8+
+- `kubectl` configured and pointing to your cluster
+- An [OpenRouter](https://openrouter.ai) API key (free tier available)
+
+### Install dependencies
+
+```bash
+pip install requests
+```
+
+### Set your API key
+
+```bash
+# Linux / macOS / Git Bash
+export OPENROUTER_API_KEY=sk-or-xxxxxxxxxxxxxxxx
+
+# Windows PowerShell
+$env:OPENROUTER_API_KEY="sk-or-xxxxxxxxxxxxxxxx"
+```
+
+---
+
+## Usage
+
+### Full analysis (static + LLM)
+
+```bash
+python kube_assessor.py -s 1.34 -t 1.35 -o report.md
+```
+
+### Static analysis only (no API key needed)
+
+```bash
+python kube_assessor.py -s 1.34 -t 1.35 --no-llm -o report.md
+```
+
+### Use a specific kubeconfig or context
+
+```bash
+python kube_assessor.py -s 1.34 -t 1.35 \
+  --kubeconfig ~/.kube/config \
+  --context kind-k8s-1.34 \
+  -o report.md
+```
+
+### Use a different LLM model
+
+```bash
+python kube_assessor.py -s 1.34 -t 1.35 \
+  --model anthropic/claude-3.5-sonnet \
+  -o report.md
+```
+
+### CLI Reference
+
+| Argument | Required | Description |
+|---|---|---|
+| `-s`, `--source` | ✅ | Source Kubernetes version (e.g. `1.34`) |
+| `-t`, `--target` | ✅ | Target Kubernetes version (e.g. `1.35`) |
+| `-o`, `--output` | | Output file path (default: stdout) |
+| `-k`, `--kubeconfig` | | Path to kubeconfig file |
+| `-c`, `--context` | | kubectl context to use |
+| `--no-llm` | | Skip LLM analysis (static only) |
+| `--model` | | OpenRouter model to use |
+
+---
+
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `OPENROUTER_API_KEY` | — | Your OpenRouter API key |
+| `OPENROUTER_MODEL` | `deepseek/deepseek-chat` | LLM model to use |
+
+---
+
+## Project Structure
+
+```
+AI_Kubernetes_Upgrader/
+├── kube_assessor.py     # Main script
+├── report.md            # Generated report (gitignored)
+├── .env                 # API keys (gitignored)
+├── .gitignore
+└── README.md
+```
+
+### .gitignore
+
+```
+.env
+report.md
+__pycache__/
+*.pyc
+```
+
+---
+
+## Example Report Output
+
+```markdown
+# Kubernetes Upgrade Readiness Assessment
+
+Generated : 2026-07-03T11:53:17Z
+Source    : v1.34
+Target    : v1.35
+
+## Executive Summary
+
+**UPGRADE DECISION : NOT RECOMMENDED**
+
+| Metric | Value |
+|--------|-------|
+| Readiness Score | 60/100 |
+| Confidence      | 95%   |
+
+### Admission Webhooks
+
+> ⚠️ 2 webhook(s) with FailurePolicy=Fail — these can block all
+> deployments if they become unavailable during upgrade.
+
+## LLM Expert Analysis
+
+### Required Actions Before Upgrade
+1. Verify exact cert-manager version and confirm 1.35 compatibility
+2. Prepare rollback procedure including cert-manager downgrade path
+3. Backup all CRDs and cluster state
+...
+```
+
+---
+
+## Tech Stack
+
+| Component | Technology |
+|---|---|
+| CLI | Python 3.8+ (argparse, subprocess) |
+| Cluster data collection | kubectl (via subprocess) |
+| LLM inference | DeepSeek via OpenRouter API |
+| Report format | Markdown |
+| Kubernetes test cluster | kind (Kubernetes IN Docker) |
+
+---
+
+## Cluster Setup (for testing)
+
+This project was tested on a local kind cluster with cert-manager and metrics-server installed:
+
+```bash
+# Create cluster
+kind create cluster --name k8s-1.34 --image kindest/node:v1.34.3
+
+# Install cert-manager
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.0/cert-manager.yaml
+
+# Install metrics-server
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+```
+
+---
+
+## Why This Approach?
+
+Production Kubernetes upgrades are risky. A wrong upgrade can:
+- Remove APIs your workloads depend on → immediate outage
+- Break admission webhooks → block all deployments cluster-wide
+- Introduce CRD incompatibilities → operators stop reconciling silently
+
+Existing tools (Pluto, kubent) only check deprecated APIs. This tool goes further by combining live cluster inspection with LLM reasoning to surface operator compatibility issues, failure scenarios, and a structured remediation plan — the kind of analysis a Senior Platform Engineer would perform before any production upgrade.
+
+---
+
+## Author
+
+**Imad Eddine Belhouideg**
+Engineering Student — Distributed & Ubiquitous Systems / Cloud-IoT
+INPT Rabat
