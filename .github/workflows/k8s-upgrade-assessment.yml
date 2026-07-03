@@ -1,0 +1,181 @@
+name: Kubernetes Upgrade Readiness Assessment
+
+on:
+  # ── Déclenchement manuel avec paramètres
+  workflow_dispatch:
+    inputs:
+      source_version:
+        description: 'Source Kubernetes version (ex: 1.34)'
+        required: true
+        default: '1.34'
+      target_version:
+        description: 'Target Kubernetes version (ex: 1.35)'
+        required: true
+        default: '1.35'
+      use_llm:
+        description: 'Enable LLM analysis'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      llm_model:
+        description: 'OpenRouter model to use'
+        required: false
+        default: 'deepseek/deepseek-chat'
+
+  # ── Déclenchement automatique chaque lundi 8h UTC
+  schedule:
+    - cron: '0 8 * * 1'
+
+jobs:
+  assess:
+    name: Upgrade Readiness Assessment
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout du repo
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Setup Python
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # ── 3. Installer les dépendances Python
+      - name: Install dependencies
+        run: pip install requests
+
+      # ── 4. Configurer kubectl avec le kubeconfig du secret
+      #
+      #    COMMENT CONFIGURER LE SECRET :
+      #    ─────────────────────────────
+      #    1. Sur ta machine locale, récupère ton kubeconfig :
+      #         cat ~/.kube/config          (Linux/macOS)
+      #         type %USERPROFILE%\.kube\config   (Windows)
+      #
+      #    2. Sur GitHub :
+      #       Settings -> Secrets and variables -> Actions -> New secret
+      #       Name  : KUBECONFIG
+      #       Value : colle le contenu complet de ton kubeconfig
+      #
+      #    Compatible avec n'importe quel cluster :
+      #       - kind (local via tunnel)
+      #       - EKS  (AWS)
+      #       - AKS  (Azure)
+      #       - GKE  (Google Cloud)
+      #       - K3s, RKE, Rancher...
+      #
+      - name: Configure kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG }}" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      # ── 5. Vérifier la connexion au cluster
+      - name: Verify cluster connection
+        run: |
+          echo "=== Cluster Info ==="
+          kubectl cluster-info
+
+          echo "=== Nodes ==="
+          kubectl get nodes -o wide
+
+          echo "=== Namespaces ==="
+          kubectl get namespaces
+
+          echo "=== CRDs ==="
+          kubectl get crd
+
+          echo "=== Webhooks ==="
+          kubectl get validatingwebhookconfigurations
+          kubectl get mutatingwebhookconfigurations
+
+      # ── 6. Lancer l'assessment - statique uniquement
+      - name: Run Assessment (static only)
+        if: ${{ github.event.inputs.use_llm != 'true' }}
+        run: |
+          python kube_assessor.py \
+            --source ${{ github.event.inputs.source_version || '1.34' }} \
+            --target ${{ github.event.inputs.target_version || '1.35' }} \
+            --no-llm \
+            --output report.md
+
+      # ── 7. Lancer l'assessment complet avec LLM
+      - name: Run Assessment (with LLM)
+        if: ${{ github.event.inputs.use_llm == 'true' }}
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          python kube_assessor.py \
+            --source ${{ github.event.inputs.source_version || '1.34' }} \
+            --target ${{ github.event.inputs.target_version || '1.35' }} \
+            --model "${{ github.event.inputs.llm_model || 'deepseek/deepseek-chat' }}" \
+            --output report.md
+
+      # ── 8. Afficher le rapport dans les logs
+      - name: Display report
+        run: cat report.md
+
+      # ── 9. Publier le rapport dans le summary GitHub
+      - name: Publish summary
+        run: |
+          DECISION=$(grep "UPGRADE DECISION" report.md | head -1 | sed 's/.*: //')
+          READINESS=$(grep "Readiness Score" report.md | head -1 | grep -oP '\d+(?=/100)')
+          CONFIDENCE=$(grep "Confidence" report.md | head -1 | grep -oP '\d+(?=%)')
+
+          if echo "$DECISION" | grep -q "APPROVED"; then
+            EMOJI="✅"
+          elif echo "$DECISION" | grep -q "CONDITIONAL"; then
+            EMOJI="⚠️"
+          else
+            EMOJI="❌"
+          fi
+
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          # $EMOJI Kubernetes Upgrade Readiness Assessment
+
+          ## Parameters
+          | Parameter | Value |
+          |-----------|-------|
+          | Source Version | ${{ github.event.inputs.source_version || '1.34' }} |
+          | Target Version | ${{ github.event.inputs.target_version || '1.35' }} |
+          | LLM Model      | ${{ github.event.inputs.llm_model || 'deepseek/deepseek-chat' }} |
+
+          ## Results
+          | Metric | Value |
+          |--------|-------|
+          | Decision        | **$DECISION** |
+          | Readiness Score | **${READINESS}/100** |
+          | Confidence      | **${CONFIDENCE}%** |
+
+          ## Full Report
+          $(cat report.md)
+          EOF
+
+      # ── 10. Archiver le rapport comme artefact
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: upgrade-readiness-report-${{ github.run_number }}
+          path: report.md
+          retention-days: 30
+
+      # ── 11. Quality Gate - echoue si NOT RECOMMENDED
+      - name: Enforce readiness gate
+        run: |
+          if grep -q "NOT RECOMMENDED" report.md; then
+            echo "GATE FAILED - Upgrade NOT RECOMMENDED"
+            echo "Review the report artifact for remediation steps."
+            exit 1
+          elif grep -q "CONDITIONAL" report.md; then
+            echo "GATE WARNING - Upgrade CONDITIONAL"
+            echo "Review required actions before proceeding."
+            exit 0
+          else
+            echo "GATE PASSED - Upgrade APPROVED"
+            exit 0
+          fi
